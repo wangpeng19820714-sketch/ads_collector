@@ -8,6 +8,12 @@ import yaml
 
 def load_config(path: str | Path = "config/config.yaml") -> dict[str, Any]:
     config_path = Path(path)
+    if not config_path.exists():
+        fallback_path = config_path.with_name("config.example.yaml")
+        if fallback_path.exists():
+            config_path = fallback_path
+        else:
+            raise FileNotFoundError(f"Config file not found: {config_path}")
     with config_path.open("r", encoding="utf-8") as file:
         return yaml.safe_load(file)
 

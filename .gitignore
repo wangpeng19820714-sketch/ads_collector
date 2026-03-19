@@ -10,3 +10,8 @@ logs/
 venv/
 dist/
 tmp/
+build/output/
+config/*.bak
+config/* copy.yaml
+config/*.local.yaml
+config/config.yaml
