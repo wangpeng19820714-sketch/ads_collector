@@ -22,7 +22,7 @@ class FacebookAdsLibraryScraper(BaseScraper):
         delay_seconds: int = 2,
         headless: bool = True,
         timeout_ms: int = 60000,
-        max_cards: int = 10,
+        max_cards: int = 50,
     ) -> None:
         self.platform = "facebook"
         self.start_url = start_url

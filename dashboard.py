@@ -62,7 +62,14 @@ PAGE_TEMPLATE = """
       display: inline-block; padding: 6px 12px; border-radius: 999px; border: 1px solid var(--line);
       background: rgba(255,255,255,0.55); font-size: 12px; letter-spacing: 0.18em; text-transform: uppercase; color: var(--muted);
     }
-    h1 { margin: 16px 0 8px; font-size: clamp(32px, 5vw, 64px); line-height: 0.95; letter-spacing: -0.04em; max-width: 10ch; }
+    h1 {
+      margin: 16px 0 8px;
+      font-size: clamp(26px, 3.4vw, 46px);
+      line-height: 1;
+      letter-spacing: -0.04em;
+      max-width: none;
+      white-space: nowrap;
+    }
     .sub { max-width: 68ch; font-size: 16px; line-height: 1.7; color: var(--muted); margin: 0; }
     .controls { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)) auto; gap: 12px; margin-top: 24px; }
     .field { display: grid; gap: 8px; }
@@ -130,7 +137,9 @@ PAGE_TEMPLATE = """
           </div>
           <div class="field">
             <label for="game_name">Game Name</label>
-            <input id="game_name" name="game_name" placeholder="Whiteout Survival / Gossip Harbor">
+            <select id="game_name" name="game_name">
+              <option value="">All Games</option>
+            </select>
           </div>
           <div class="field">
             <label for="limit">Limit</label>
@@ -184,6 +193,7 @@ PAGE_TEMPLATE = """
     const errorEl = document.getElementById('error');
     const emptyEl = document.getElementById('empty');
     const statusEl = document.getElementById('status');
+    const gameNameEl = document.getElementById('game_name');
     const statTotalEl = document.getElementById('stat-total');
     const statPlatformsEl = document.getElementById('stat-platforms');
     const statLatestEl = document.getElementById('stat-latest');
@@ -212,6 +222,31 @@ PAGE_TEMPLATE = """
         errorEl.textContent = error.message;
         errorEl.style.display = 'block';
         statusEl.textContent = 'Error';
+      }
+    }
+
+    async function loadGameOptions() {
+      try {
+        const response = await fetch('/api/game-names');
+        const payload = await response.json();
+        if (!response.ok) {
+          throw new Error(payload.error || 'Failed to load game names');
+        }
+
+        const currentValue = gameNameEl.value;
+        gameNameEl.innerHTML = '<option value="">All Games</option>';
+        payload.game_names.forEach((name) => {
+          const option = document.createElement('option');
+          option.value = name;
+          option.textContent = name;
+          if (name === currentValue) {
+            option.selected = true;
+          }
+          gameNameEl.appendChild(option);
+        });
+      } catch (error) {
+        errorEl.textContent = error.message;
+        errorEl.style.display = 'block';
       }
     }
 
@@ -250,7 +285,7 @@ PAGE_TEMPLATE = """
       loadData();
     });
 
-    loadData();
+    Promise.all([loadGameOptions(), loadData()]);
   </script>
 </body>
 </html>
@@ -297,6 +332,21 @@ def get_rows(limit: int, platform: str | None, game_name: str | None, connect_ti
     return normalized_rows
 
 
+def get_game_names(connect_timeout: int) -> list[str]:
+    config = load_config()
+    dsn = build_postgres_dsn(config["database"])
+    query = """
+    SELECT DISTINCT game_name
+    FROM ads_creative
+    WHERE game_name IS NOT NULL AND game_name <> ''
+    ORDER BY game_name ASC
+    """
+    with psycopg.connect(dsn, connect_timeout=connect_timeout) as conn, conn.cursor() as cur:
+        cur.execute(query)
+        rows = cur.fetchall()
+    return [row[0] for row in rows]
+
+
 class DashboardHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
@@ -305,6 +355,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/ads":
             self.handle_api_ads(parsed.query)
+            return
+        if parsed.path == "/api/game-names":
+            self.handle_game_names(parsed.query)
             return
         self.send_error(HTTPStatus.NOT_FOUND, "Not Found")
 
@@ -344,6 +397,25 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 },
             }
         )
+
+    def handle_game_names(self, query_string: str) -> None:
+        query = parse_qs(query_string)
+        connect_timeout = clamp_int(query.get("connect_timeout", ["5"])[0], minimum=1, maximum=30, default=5)
+        try:
+            game_names = get_game_names(connect_timeout=connect_timeout)
+        except OperationalError as exc:
+            config = load_config()
+            db = config["database"]
+            self.respond_json(
+                {"error": f"无法连接 Postgres: {db['host']}:{db['port']}/{db['name']}。详情: {exc}"},
+                status=HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
+            return
+        except Exception as exc:
+            self.respond_json({"error": f"读取游戏名失败: {exc}"}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
+            return
+
+        self.respond_json({"game_names": game_names})
 
     def respond_html(self, body: str, status: HTTPStatus = HTTPStatus.OK) -> None:
         encoded = body.encode("utf-8")
