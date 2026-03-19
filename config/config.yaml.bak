@@ -1,0 +1,22 @@
+platforms:
+  - tiktok
+  - facebook
+
+scrape:
+  max_scroll: 10
+  delay: 2
+  headless: true
+
+database:
+  type: postgres
+  host: localhost
+  port: 5507
+  name: ads_collector
+  user: postgres
+  password: postgres
+  connect_timeout: 5
+
+logging:
+  level: INFO
+  file: logs/app.log
+
