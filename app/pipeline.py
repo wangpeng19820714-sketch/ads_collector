@@ -28,6 +28,7 @@ class AdsCollectionPipeline:
     def run(self, game_name: str | None = None) -> PipelineResult:
         self.storage.init_schema()
         raw_records = self.scraper.scrape(game_name=game_name)
+        expected_game_name = self._normalize_name(game_name)
 
         parsed_records: list[ParsedAd] = []
         failed = 0
@@ -42,6 +43,17 @@ class AdsCollectionPipeline:
         inserted = 0
         updated = 0
         for ad in parsed_records:
+            normalized_ad_name = self._normalize_name(ad.game_name)
+            if expected_game_name and normalized_ad_name != expected_game_name:
+                logger.info(
+                    "skipped ad due to exact game-name mismatch",
+                    extra={
+                        "platform": ad.platform,
+                        "expected_game_name": game_name,
+                        "parsed_game_name": ad.game_name,
+                    },
+                )
+                continue
             hook_type = self.classifier.classify(ad)
             logger.info(
                 "parsed ad",
@@ -65,4 +77,11 @@ class AdsCollectionPipeline:
             updated=updated,
             failed=failed,
         )
+
+    @staticmethod
+    def _normalize_name(value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = " ".join(value.split()).strip().casefold()
+        return normalized or None
 

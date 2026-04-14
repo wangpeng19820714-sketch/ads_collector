@@ -4,12 +4,18 @@ import json
 import os
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 import psycopg
 from psycopg import OperationalError
 
 from app.config import build_postgres_dsn, load_config
+from app.logging_config import setup_logging
+from app.pipeline import AdsCollectionPipeline
+from scraper.facebook_scraper import FacebookAdsLibraryScraper
+from scraper.tiktok_scraper import TikTokCreativeCenterScraper
+from storage.db import PostgresStorage
 
 PAGE_TEMPLATE = """
 <!doctype html>
@@ -72,6 +78,8 @@ PAGE_TEMPLATE = """
     }
     .sub { max-width: 68ch; font-size: 16px; line-height: 1.7; color: var(--muted); margin: 0; }
     .controls { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)) auto; gap: 12px; margin-top: 24px; }
+    .collector { margin-top: 18px; padding-top: 18px; border-top: 1px solid var(--line); display: grid; gap: 14px; }
+    .collector-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)) auto; gap: 12px; }
     .field { display: grid; gap: 8px; }
     .field label { font-size: 12px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--muted); }
     .field input, .field select {
@@ -84,6 +92,16 @@ PAGE_TEMPLATE = """
       background: linear-gradient(135deg, #b3491c, var(--accent)); color: #fff8f2;
       font-size: 15px; font-weight: 700; cursor: pointer;
       box-shadow: 0 14px 30px rgba(198, 93, 46, 0.24);
+    }
+    .button.secondary {
+      background: linear-gradient(135deg, #3f5c4f, #547463);
+      box-shadow: 0 14px 30px rgba(63, 92, 79, 0.18);
+    }
+    .helper {
+      font-size: 14px;
+      color: var(--muted);
+      line-height: 1.6;
+      margin: 0;
     }
     .meta { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; padding: 0 28px 28px; position: relative; }
     .stat { border: 1px solid var(--line); border-radius: 20px; padding: 18px; background: rgba(255,255,255,0.56); }
@@ -126,33 +144,56 @@ PAGE_TEMPLATE = """
         <span class="eyebrow">Ads Data Collector</span>
         <h1>Creative Archive Viewer</h1>
         <p class="sub">启动后直接查看库里的广告内容。可以按平台、游戏名和数量筛选，快速确认抓取结果、Hook 文案和时间区间。</p>
-        <form class="controls" id="filters">
+        <form class="collector-grid" id="collector">
           <div class="field">
-            <label for="platform">Platform</label>
-            <select id="platform" name="platform">
-              <option value="">All</option>
+            <label for="collect_platform">Collect Platform</label>
+            <select id="collect_platform" name="platform">
               <option value="facebook">Facebook</option>
               <option value="tiktok">TikTok</option>
             </select>
           </div>
           <div class="field">
-            <label for="game_name">Game Name</label>
-            <select id="game_name" name="game_name">
-              <option value="">All Games</option>
-            </select>
+            <label for="collect_game_name">Keyword / Game</label>
+            <input id="collect_game_name" name="game_name" type="text" value="Gossip Harbor" placeholder="Whiteout Survival">
           </div>
           <div class="field">
-            <label for="limit">Limit</label>
-            <input id="limit" name="limit" type="number" min="1" max="200" value="20">
-          </div>
-          <div class="field">
-            <label for="connect_timeout">DB Timeout</label>
-            <input id="connect_timeout" name="connect_timeout" type="number" min="1" max="30" value="5">
+            <label for="collect_timeout">DB Timeout</label>
+            <input id="collect_timeout" name="connect_timeout" type="number" min="1" max="30" value="5">
           </div>
           <div class="actions">
-            <button class="button" type="submit">View Records</button>
+            <button class="button secondary" type="submit" id="collect_button">Collect Live Ads</button>
           </div>
         </form>
+        <section class="collector">
+          <p class="helper">Use the top row to collect live ads into Postgres. Use the row below to filter and inspect the data already stored in the database.</p>
+          <form class="controls" id="filters">
+            <div class="field">
+              <label for="platform">Platform</label>
+              <select id="platform" name="platform">
+                <option value="">All</option>
+                <option value="facebook">Facebook</option>
+                <option value="tiktok">TikTok</option>
+              </select>
+            </div>
+            <div class="field">
+              <label for="game_name">Game Name</label>
+              <select id="game_name" name="game_name">
+                <option value="">All Games</option>
+              </select>
+            </div>
+            <div class="field">
+              <label for="limit">Limit</label>
+              <input id="limit" name="limit" type="number" min="1" max="200" value="20">
+            </div>
+            <div class="field">
+              <label for="connect_timeout">DB Timeout</label>
+              <input id="connect_timeout" name="connect_timeout" type="number" min="1" max="30" value="5">
+            </div>
+            <div class="actions">
+              <button class="button" type="submit">View Records</button>
+            </div>
+          </form>
+        </section>
       </div>
       <div class="meta">
         <article class="stat"><div class="label">Total Rows</div><div class="value" id="stat-total">-</div></article>
@@ -197,6 +238,10 @@ PAGE_TEMPLATE = """
     const statTotalEl = document.getElementById('stat-total');
     const statPlatformsEl = document.getElementById('stat-platforms');
     const statLatestEl = document.getElementById('stat-latest');
+    const collectorForm = document.getElementById('collector');
+    const collectButton = document.getElementById('collect_button');
+    const collectPlatformEl = document.getElementById('collect_platform');
+    const collectGameNameEl = document.getElementById('collect_game_name');
 
     const escapeHtml = (value) => String(value ?? '')
       .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
@@ -250,6 +295,41 @@ PAGE_TEMPLATE = """
       }
     }
 
+    async function runCollection() {
+      const payload = {
+        platform: collectPlatformEl.value,
+        game_name: collectGameNameEl.value.trim(),
+        connect_timeout: document.getElementById('collect_timeout').value,
+      };
+      statusEl.textContent = 'Collecting live ads...';
+      errorEl.style.display = 'none';
+      collectButton.disabled = true;
+      try {
+        const response = await fetch('/api/collect', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.error || 'Collection failed');
+        statusEl.textContent = `Collected ${result.scraped} ads, inserted ${result.inserted}, updated ${result.updated}`;
+        if (payload.platform) {
+          document.getElementById('platform').value = payload.platform;
+        }
+        if (payload.game_name) {
+          await loadGameOptions();
+          document.getElementById('game_name').value = payload.game_name;
+        }
+        await loadData();
+      } catch (error) {
+        errorEl.textContent = error.message;
+        errorEl.style.display = 'block';
+        statusEl.textContent = 'Collect failed';
+      } finally {
+        collectButton.disabled = false;
+      }
+    }
+
     function renderRows(rows) {
       rowsEl.innerHTML = '';
       if (!rows.length) {
@@ -285,11 +365,78 @@ PAGE_TEMPLATE = """
       loadData();
     });
 
+    collectorForm.addEventListener('submit', (event) => {
+      event.preventDefault();
+      runCollection();
+    });
+
     Promise.all([loadGameOptions(), loadData()]);
   </script>
 </body>
 </html>
 """
+
+
+def resolve_playwright_browsers_path() -> str:
+    default_path = Path(os.environ.get("LocalAppData", "")) / "ms-playwright"
+    local_path = Path.cwd() / ".playwright-browsers"
+
+    for candidate in (default_path, local_path):
+        try:
+            if any(candidate.glob("chromium-*/chrome-win64/chrome.exe")):
+                return str(candidate)
+        except Exception:
+            continue
+
+    return str(default_path)
+
+
+def build_live_scraper(platform: str, config: dict):
+    scrape_config = config.get("scrape", {})
+    if platform == "facebook":
+        facebook_config = config.get("facebook", {})
+        return FacebookAdsLibraryScraper(
+            start_url=facebook_config.get(
+                "start_url",
+                "https://www.facebook.com/ads/library/?active_status=all&ad_type=all&country=ALL&is_targeted_country=false&media_type=all&search_type=keyword_unordered",
+            ),
+            max_scroll=scrape_config.get("max_scroll", 5),
+            delay_seconds=scrape_config.get("delay", 2),
+            headless=scrape_config.get("headless", True),
+            timeout_ms=scrape_config.get("timeout_ms", 60000),
+        )
+
+    if platform == "tiktok":
+        tiktok_config = config.get("tiktok", {})
+        return TikTokCreativeCenterScraper(
+            start_url=tiktok_config.get(
+                "start_url",
+                "https://ads.tiktok.com/business/creativecenter/inspiration/topads/pc/en",
+            ),
+            max_scroll=scrape_config.get("max_scroll", 10),
+            delay_seconds=scrape_config.get("delay", 2),
+            headless=scrape_config.get("headless", True),
+            card_selectors=tiktok_config.get("card_selectors"),
+            timeout_ms=scrape_config.get("timeout_ms", 60000),
+        )
+
+    raise ValueError(f"Unsupported platform: {platform}")
+
+
+def run_live_collection(platform: str, game_name: str | None) -> dict[str, int]:
+    config = load_config()
+    os.environ["PLAYWRIGHT_BROWSERS_PATH"] = resolve_playwright_browsers_path()
+    scraper = build_live_scraper(platform=platform, config=config)
+    storage = PostgresStorage(build_postgres_dsn(config["database"]))
+    pipeline = AdsCollectionPipeline(scraper=scraper, storage=storage)
+    result = pipeline.run(game_name=game_name or None)
+    return {
+        "scraped": result.scraped,
+        "parsed": result.parsed,
+        "inserted": result.inserted,
+        "updated": result.updated,
+        "failed": result.failed,
+    }
 
 
 def clamp_int(raw_value: str, minimum: int, maximum: int, default: int) -> int:
@@ -361,6 +508,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return
         self.send_error(HTTPStatus.NOT_FOUND, "Not Found")
 
+    def do_POST(self) -> None:
+        parsed = urlparse(self.path)
+        if parsed.path == "/api/collect":
+            self.handle_collect()
+            return
+        self.send_error(HTTPStatus.NOT_FOUND, "Not Found")
+
     def log_message(self, format: str, *args) -> None:  # noqa: A003
         return
 
@@ -417,6 +571,40 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
         self.respond_json({"game_names": game_names})
 
+    def handle_collect(self) -> None:
+        content_length = int(self.headers.get("Content-Length", "0"))
+        raw_body = self.rfile.read(content_length) if content_length else b"{}"
+        try:
+            payload = json.loads(raw_body.decode("utf-8"))
+        except json.JSONDecodeError:
+            self.respond_json({"error": "Invalid JSON payload."}, status=HTTPStatus.BAD_REQUEST)
+            return
+
+        platform = str(payload.get("platform", "facebook")).strip().lower()
+        game_name = str(payload.get("game_name", "")).strip() or None
+        if platform not in {"facebook", "tiktok"}:
+            self.respond_json({"error": "Platform must be facebook or tiktok."}, status=HTTPStatus.BAD_REQUEST)
+            return
+        if not game_name:
+            self.respond_json({"error": "Please provide a game name or keyword."}, status=HTTPStatus.BAD_REQUEST)
+            return
+
+        try:
+            result = run_live_collection(platform=platform, game_name=game_name)
+        except OperationalError as exc:
+            config = load_config()
+            db = config["database"]
+            self.respond_json(
+                {"error": f"Failed to connect to Postgres at {db['host']}:{db['port']}/{db['name']}. Details: {exc}"},
+                status=HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
+            return
+        except Exception as exc:
+            self.respond_json({"error": f"Live collection failed: {exc}"}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
+            return
+
+        self.respond_json(result)
+
     def respond_html(self, body: str, status: HTTPStatus = HTTPStatus.OK) -> None:
         encoded = body.encode("utf-8")
         self.send_response(status)
@@ -435,6 +623,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
 
 def main():
+    config = load_config()
+    setup_logging(
+        level=config.get("logging", {}).get("level", "INFO"),
+        log_file=config.get("logging", {}).get("file"),
+    )
     host = os.environ.get("ADS_VIEWER_HOST", "127.0.0.1")
     port = int(os.environ.get("ADS_VIEWER_PORT", "8787"))
     server = ThreadingHTTPServer((host, port), DashboardHandler)
