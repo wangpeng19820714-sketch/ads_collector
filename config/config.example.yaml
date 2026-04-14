@@ -3,7 +3,7 @@ platforms:
   - facebook
 
 scrape:
-  max_scroll: 10
+  max_scroll: 30
   delay: 2
   headless: true
 
@@ -13,7 +13,7 @@ database:
   port: 5507
   name: ads_collector
   user: postgres
-  password: CHANGE_ME
+  password: 123456
   connect_timeout: 5
 
 logging:
